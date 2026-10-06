@@ -3,14 +3,14 @@
 use crate::audio::{AudioController, AudioDevice, AudioSnapshot, SplitSession, StartOutcome};
 use crate::config::AppConfig;
 use cosmic::app::{Task, context_drawer};
-use cosmic::iced::Length;
 use cosmic::iced::alignment::Horizontal;
+use cosmic::iced::{Length, Subscription};
 use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, settings};
 use std::collections::HashSet;
 
 const APP_ICON: &[u8] =
-    include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.okrroni.AudioSplitter.svg");
+    include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.okrroni.splitter.svg");
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContextPage {
@@ -28,6 +28,7 @@ enum Busy {
 
 #[derive(Clone, Debug)]
 pub enum Message {
+    AudioChanged,
     DevicesLoaded(Result<AudioSnapshot, String>),
     DeviceVolumeChanged(String, u32),
     DeviceVolumeSet(Result<(), String>),
@@ -61,7 +62,7 @@ impl cosmic::Application for AppModel {
     type Flags = crate::Flags;
     type Message = Message;
 
-    const APP_ID: &'static str = "io.github.okrroni.AudioSplitter";
+    const APP_ID: &'static str = "io.github.okrroni.splitter";
 
     fn core(&self) -> &cosmic::Core {
         &self.core
@@ -125,6 +126,10 @@ impl cosmic::Application for AppModel {
                 Message::ToggleContextPage(ContextPage::About),
             ),
         })
+    }
+
+    fn subscription(&self) -> Subscription<Self::Message> {
+        AudioController::subscription().map(|()| Message::AudioChanged)
     }
 
     fn view(&self) -> Element<'_, Self::Message> {
@@ -298,17 +303,59 @@ impl cosmic::Application for AppModel {
 
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
+            Message::AudioChanged => {
+                if self.busy.is_none() {
+                    self.busy = Some(Busy::Refreshing);
+                    return discover_task(false);
+                }
+            }
             Message::DevicesLoaded(result) => {
                 self.busy = None;
                 match result {
                     Ok(snapshot) => {
+                        let split_active = snapshot.split_active;
+                        let recovery_notice = snapshot.notice;
                         self.devices = snapshot.devices;
                         self.default_sink = snapshot.default_sink;
                         self.initialize_selection();
+
+                        if let Some(notice) = recovery_notice {
+                            self.notice = Some(notice);
+                        }
+
+                        if let Some(session) = &self.session {
+                            if !split_active {
+                                self.session = None;
+                                self.notice = Some(
+                                    "The temporary audio route stopped outside Audio Splitter. The available outputs were refreshed."
+                                        .to_owned(),
+                                );
+                                self.busy = Some(Busy::Refreshing);
+                                return discover_task(true);
+                            } else {
+                                let available = self
+                                    .devices
+                                    .iter()
+                                    .map(|device| device.name.as_str())
+                                    .collect::<HashSet<_>>();
+                                let missing = session
+                                    .outputs
+                                    .iter()
+                                    .filter(|output| !available.contains(output.as_str()))
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                if !missing.is_empty() {
+                                    self.notice = Some(format!(
+                                        "An active output disconnected ({}). The split will stop safely.",
+                                        missing.join(", ")
+                                    ));
+                                    self.busy = Some(Busy::Stopping);
+                                    return stop_task(session.clone());
+                                }
+                            }
+                        }
                     }
                     Err(error) => {
-                        self.devices.clear();
-                        self.default_sink = None;
                         self.notice = Some(error);
                     }
                 }
@@ -366,11 +413,7 @@ impl cosmic::Application for AppModel {
                     && let Some(session) = self.session.clone()
                 {
                     self.busy = Some(Busy::Stopping);
-                    return cosmic::task::future(async move {
-                        Message::Stopped(
-                            run_blocking(move || AudioController::stop(&session)).await,
-                        )
-                    });
+                    return stop_task(session);
                 }
             }
             Message::Stopped(result) => {
@@ -516,6 +559,12 @@ fn discover_task(prepare: bool) -> Task<Message> {
             })
             .await,
         )
+    })
+}
+
+fn stop_task(session: SplitSession) -> Task<Message> {
+    cosmic::task::future(async move {
+        Message::Stopped(run_blocking(move || AudioController::stop(&session)).await)
     })
 }
 

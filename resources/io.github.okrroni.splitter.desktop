@@ -2,7 +2,7 @@
 Name=Audio Splitter
 Comment=Play desktop audio through multiple outputs
 Type=Application
-Icon=io.github.okrroni.AudioSplitter
+Icon=io.github.okrroni.splitter
 Exec=cosmic-audio-splitter
 Terminal=false
 StartupNotify=true

@@ -1,5 +1,5 @@
 name := "cosmic-audio-splitter"
-appid := "io.github.okrroni.AudioSplitter"
+appid := "io.github.okrroni.splitter"
 rootdir := ""
 prefix := "/usr"
 cargo-target-dir := env("CARGO_TARGET_DIR", "target")

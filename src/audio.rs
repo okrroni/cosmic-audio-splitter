@@ -1,21 +1,26 @@
 // SPDX-License-Identifier: MIT
 
-//! PipeWire routing through its PulseAudio-compatible control protocol.
+//! Transactional PipeWire routing through its PulseAudio-compatible protocol.
 //!
-//! PipeWire performs the actual fan-out, resampling, and clock synchronization.
-//! This module only manages the graph through `pactl`, which keeps audio samples
-//! out of the application process and out of the UI event loop.
+//! The UI only talks to [`AudioController`]. Command execution, persistent
+//! recovery state, and routing transactions remain behind replaceable traits.
 
-use serde::Deserialize;
-use serde_json::Value;
+mod journal;
+mod pactl;
+
+use cosmic::iced::Subscription;
+use journal::{FileSessionStore, SessionStore};
+use pactl::PactlBackend;
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
+use std::sync::{Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 use thiserror::Error;
 
 pub const VIRTUAL_SINK_NAME: &str = "cosmic_audio_splitter";
-const VIRTUAL_SINK_DESCRIPTION: &str = "Audio Splitter";
+pub(super) const VIRTUAL_SINK_DESCRIPTION: &str = "Audio Splitter";
+static AUDIO_TRANSACTION: Mutex<()> = Mutex::new(());
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AudioDevice {
@@ -31,20 +36,31 @@ pub struct AudioDevice {
 pub struct AudioSnapshot {
     pub devices: Vec<AudioDevice>,
     pub default_sink: Option<String>,
+    pub split_active: bool,
+    pub notice: Option<String>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MovedInput {
     input_index: u32,
     original_sink: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionPhase {
+    Starting,
+    Active,
+    Stopping,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct SplitSession {
-    pub module_index: u32,
+    pub module_index: Option<u32>,
     pub previous_default: Option<String>,
     pub outputs: Vec<String>,
     moved_inputs: Vec<MovedInput>,
+    phase: SessionPhase,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -57,64 +73,154 @@ pub struct StartOutcome {
 pub enum AudioError {
     #[error("PipeWire audio controls are unavailable: {0}")]
     Unavailable(String),
+    #[error("audio control timed out while running {0}")]
+    Timeout(String),
     #[error("audio command failed: {0}")]
     Command(String),
     #[error("PipeWire returned data that could not be read: {0}")]
     InvalidData(String),
+    #[error("Audio Splitter requires pipewire-pulse, but the current server is {0}")]
+    UnsupportedServer(String),
     #[error("select at least two available audio outputs")]
     NotEnoughOutputs,
     #[error("an audio output has an unsupported internal name: {0}")]
     UnsafeName(String),
     #[error("these selected outputs are no longer available: {0}")]
     MissingOutputs(String),
-    #[error("audio splitting stopped with errors: {0}")]
+    #[error("session recovery state failed: {0}")]
+    Journal(String),
+    #[error("audio splitting could not start: {0}")]
+    StartFailed(String),
+    #[error("audio splitting could not be stopped safely: {0}")]
     StopFailed(String),
 }
 
-#[derive(Debug, Deserialize)]
-struct PactlSink {
+#[derive(Clone, Debug)]
+pub(super) struct SinkRecord {
     index: u32,
     name: String,
     description: Option<String>,
     state: Option<String>,
     sample_specification: Option<String>,
-    #[serde(default)]
-    volume: HashMap<String, PactlChannelVolume>,
-    #[serde(default)]
-    properties: HashMap<String, Value>,
+    volume_percent: u32,
+    icon_name: String,
 }
 
-#[derive(Debug, Deserialize)]
-struct PactlChannelVolume {
-    value_percent: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PactlModule {
-    /// PipeWire's built-in modules are visible through pactl but do not have a
-    /// PulseAudio module index. Only dynamically loaded modules can be unloaded.
+#[derive(Clone, Debug)]
+pub(super) struct ModuleRecord {
     index: Option<u32>,
     name: String,
     argument: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct PactlSinkInput {
+#[derive(Clone, Debug)]
+pub(super) struct InputRecord {
     index: u32,
     sink: u32,
+}
+
+pub(super) trait AudioBackend {
+    fn server_name(&self) -> Result<String, AudioError>;
+    fn list_sinks(&self) -> Result<Vec<SinkRecord>, AudioError>;
+    fn list_modules(&self) -> Result<Vec<ModuleRecord>, AudioError>;
+    fn list_inputs(&self) -> Result<Vec<InputRecord>, AudioError>;
+    fn default_sink(&self) -> Result<String, AudioError>;
+    fn load_combine_sink(
+        &self,
+        outputs: &[String],
+        latency_compensation: bool,
+    ) -> Result<u32, AudioError>;
+    fn set_default_sink(&self, name: &str) -> Result<(), AudioError>;
+    fn move_input(&self, index: u32, sink: &str) -> Result<(), AudioError>;
+    fn unload_module(&self, index: u32) -> Result<(), AudioError>;
+    fn set_volume(&self, name: &str, volume_percent: u32) -> Result<(), AudioError>;
 }
 
 pub struct AudioController;
 
 impl AudioController {
-    /// Remove a combine sink left behind by a previous crash, then enumerate outputs.
     pub fn prepare() -> Result<AudioSnapshot, AudioError> {
-        Self::cleanup_owned_modules(None)?;
-        Self::discover()
+        let _guard = transaction_guard()?;
+        system_service()?.prepare()
     }
 
     pub fn discover() -> Result<AudioSnapshot, AudioError> {
-        let sinks = list_sinks()?;
+        system_service()?.discover()
+    }
+
+    pub fn start(
+        outputs: Vec<String>,
+        latency_compensation: bool,
+    ) -> Result<StartOutcome, AudioError> {
+        let _guard = transaction_guard()?;
+        system_service()?.start(outputs, latency_compensation)
+    }
+
+    pub fn stop(session: &SplitSession) -> Result<(), AudioError> {
+        let _guard = transaction_guard()?;
+        system_service()?.stop(session)
+    }
+
+    pub fn set_volume(name: &str, volume_percent: u32) -> Result<(), AudioError> {
+        if !is_safe_pulse_name(name) {
+            return Err(AudioError::UnsafeName(name.to_owned()));
+        }
+        PactlBackend::default().set_volume(name, volume_percent)
+    }
+
+    pub fn subscription() -> Subscription<()> {
+        Subscription::run(pactl::event_stream)
+    }
+}
+
+fn transaction_guard() -> Result<MutexGuard<'static, ()>, AudioError> {
+    AUDIO_TRANSACTION
+        .lock()
+        .map_err(|_| AudioError::Command("the audio transaction lock was poisoned".to_owned()))
+}
+
+fn system_service() -> Result<AudioService<PactlBackend, FileSessionStore>, AudioError> {
+    Ok(AudioService::new(
+        PactlBackend::default(),
+        FileSessionStore::system()?,
+    ))
+}
+
+struct AudioService<B, S> {
+    backend: B,
+    store: S,
+}
+
+impl<B: AudioBackend, S: SessionStore> AudioService<B, S> {
+    fn new(backend: B, store: S) -> Self {
+        Self { backend, store }
+    }
+
+    fn prepare(&self) -> Result<AudioSnapshot, AudioError> {
+        self.ensure_pipewire()?;
+        let loaded = self.store.load()?;
+        let mut notices = loaded.warning.into_iter().collect::<Vec<_>>();
+
+        if let Some(session) = loaded.session {
+            self.stop_transaction(&session)?;
+            notices.push("Recovered the audio route from an interrupted session.".to_owned());
+        } else {
+            let removed = self.cleanup_owned_modules(None)?;
+            if removed > 0 {
+                notices.push(format!(
+                    "Removed {removed} temporary audio route(s) left by an interrupted session."
+                ));
+            }
+        }
+
+        let mut snapshot = self.discover()?;
+        snapshot.notice = combine_notices(notices);
+        Ok(snapshot)
+    }
+
+    fn discover(&self) -> Result<AudioSnapshot, AudioError> {
+        let sinks = self.backend.list_sinks()?;
+        let split_active = sinks.iter().any(|sink| sink.name == VIRTUAL_SINK_NAME);
         let mut devices = sinks
             .into_iter()
             .filter(|sink| sink.name != VIRTUAL_SINK_NAME)
@@ -130,33 +236,48 @@ impl AudioController {
 
         Ok(AudioSnapshot {
             devices,
-            default_sink: get_default_sink().ok(),
+            default_sink: Some(self.backend.default_sink()?),
+            split_active,
+            notice: None,
         })
     }
 
-    pub fn start(
+    fn start(
+        &self,
         outputs: Vec<String>,
         latency_compensation: bool,
     ) -> Result<StartOutcome, AudioError> {
+        self.ensure_pipewire()?;
+
         let mut seen = HashSet::new();
         let outputs = outputs
             .into_iter()
             .filter(|output| seen.insert(output.clone()))
             .collect::<Vec<_>>();
-
         if outputs.len() < 2 {
             return Err(AudioError::NotEnoughOutputs);
         }
-
         for output in &outputs {
             if !is_safe_pulse_name(output) {
                 return Err(AudioError::UnsafeName(output.clone()));
             }
         }
 
-        let available = list_sinks()?;
+        let existing = self.store.load()?;
+        let mut warnings = existing.warning.into_iter().collect::<Vec<_>>();
+        if let Some(session) = existing.session {
+            self.stop_transaction(&session)?;
+            warnings.push("Recovered an unfinished audio session before starting.".to_owned());
+        }
+        let removed = self.cleanup_owned_modules(outputs.first().map(String::as_str))?;
+        if removed > 0 {
+            warnings.push(format!("Removed {removed} stale temporary audio route(s)."));
+        }
+
+        let available = self.backend.list_sinks()?;
         let available_names = available
             .iter()
+            .filter(|sink| sink.name != VIRTUAL_SINK_NAME)
             .map(|sink| sink.name.as_str())
             .collect::<HashSet<_>>();
         let missing = outputs
@@ -168,15 +289,13 @@ impl AudioController {
             return Err(AudioError::MissingOutputs(missing.join(", ")));
         }
 
-        Self::cleanup_owned_modules(outputs.first().map(String::as_str))?;
-
-        let previous_default = get_default_sink().ok();
         let sink_names_by_index = available
             .iter()
             .map(|sink| (sink.index, sink.name.clone()))
             .collect::<HashMap<_, _>>();
-        let moved_inputs = list_sink_inputs()
-            .unwrap_or_default()
+        let moved_inputs = self
+            .backend
+            .list_inputs()?
             .into_iter()
             .filter_map(|input| {
                 sink_names_by_index
@@ -189,159 +308,259 @@ impl AudioController {
             })
             .collect::<Vec<_>>();
 
-        let module_args = module_arguments(&outputs, latency_compensation);
-        let module_index = run_pactl(&module_args)?
-            .trim()
-            .parse::<u32>()
-            .map_err(|error| AudioError::InvalidData(format!("invalid module ID: {error}")))?;
+        let mut session = SplitSession {
+            module_index: None,
+            previous_default: Some(self.backend.default_sink()?),
+            outputs,
+            moved_inputs,
+            phase: SessionPhase::Starting,
+        };
+        self.store.save(&session)?;
 
-        if let Err(error) = wait_for_sink(VIRTUAL_SINK_NAME) {
-            let _ = unload_module(module_index);
-            return Err(error);
-        }
+        let start_result = (|| {
+            let module_index = self
+                .backend
+                .load_combine_sink(&session.outputs, latency_compensation)?;
+            session.module_index = Some(module_index);
+            self.store.save(&session)?;
 
-        if let Err(error) = set_default_sink(VIRTUAL_SINK_NAME) {
-            let _ = unload_module(module_index);
-            return Err(error);
-        }
+            self.wait_for_sink(VIRTUAL_SINK_NAME)?;
+            self.backend.set_default_sink(VIRTUAL_SINK_NAME)?;
 
-        let mut move_failures = 0usize;
-        for input in &moved_inputs {
-            if move_sink_input(input.input_index, VIRTUAL_SINK_NAME).is_err() {
-                // A stream may disappear naturally while Start is being processed.
-                move_failures += 1;
+            let mut move_failures = 0usize;
+            for input in &session.moved_inputs {
+                if self
+                    .backend
+                    .move_input(input.input_index, VIRTUAL_SINK_NAME)
+                    .is_err()
+                {
+                    move_failures += 1;
+                }
             }
-        }
+            if move_failures > 0 {
+                warnings.push(format!(
+                    "{move_failures} audio stream(s) ended before they could be moved; new audio will still use the split output"
+                ));
+            }
 
-        let warning = (move_failures > 0).then(|| {
-            format!(
-                "{move_failures} audio stream(s) ended before they could be moved; new audio will still use the split output"
-            )
-        });
+            session.phase = SessionPhase::Active;
+            self.store.save(&session)
+        })();
+
+        if let Err(error) = start_result {
+            let rollback = self.stop_transaction(&session).err();
+            let message = rollback.map_or_else(
+                || error.to_string(),
+                |rollback| format!("{error}; rollback also failed: {rollback}"),
+            );
+            return Err(AudioError::StartFailed(message));
+        }
 
         Ok(StartOutcome {
-            session: SplitSession {
-                module_index,
-                previous_default,
-                outputs,
-                moved_inputs,
-            },
-            warning,
+            session,
+            warning: combine_notices(warnings),
         })
     }
 
-    pub fn set_volume(name: &str, volume_percent: u32) -> Result<(), AudioError> {
-        if !is_safe_pulse_name(name) {
-            return Err(AudioError::UnsafeName(name.to_owned()));
-        }
-
-        run_pactl(&[
-            "set-sink-volume".to_owned(),
-            name.to_owned(),
-            format!("{}%", volume_percent.min(100)),
-        ])
-        .map(|_| ())
+    fn stop(&self, session: &SplitSession) -> Result<(), AudioError> {
+        self.stop_transaction(session)
     }
 
-    pub fn stop(session: &SplitSession) -> Result<(), AudioError> {
-        let mut errors = Vec::new();
-        let sinks = list_sinks().unwrap_or_default();
-        let sink_names_by_index = sinks
+    fn stop_transaction(&self, session: &SplitSession) -> Result<(), AudioError> {
+        let mut warnings = Vec::new();
+        let mut stopping = session.clone();
+        stopping.phase = SessionPhase::Stopping;
+        if let Err(error) = self.store.save(&stopping) {
+            warnings.push(error.to_string());
+        }
+
+        let sinks = self.backend.list_sinks().map_err(|error| {
+            AudioError::StopFailed(format!(
+                "could not inspect outputs before recovery: {error}"
+            ))
+        })?;
+        let available_names = sinks
             .iter()
-            .map(|sink| (sink.index, sink.name.as_str()))
-            .collect::<HashMap<_, _>>();
+            .map(|sink| sink.name.as_str())
+            .collect::<HashSet<_>>();
         let virtual_index = sinks
             .iter()
             .find(|sink| sink.name == VIRTUAL_SINK_NAME)
             .map(|sink| sink.index);
+        let fallback = choose_fallback(session, &sinks);
 
-        if get_default_sink().ok().as_deref() == Some(VIRTUAL_SINK_NAME)
-            && let Some(previous) = session
-                .previous_default
-                .as_deref()
-                .filter(|name| sinks.iter().any(|sink| sink.name == *name))
-            && let Err(error) = set_default_sink(previous)
-        {
-            errors.push(error.to_string());
+        if self.backend.default_sink().ok().as_deref() == Some(VIRTUAL_SINK_NAME) {
+            if let Some(fallback) = fallback.as_deref() {
+                if let Err(error) = self.backend.set_default_sink(fallback) {
+                    warnings.push(error.to_string());
+                }
+            } else {
+                warnings.push("no physical output is available to become the default".to_owned());
+            }
         }
 
         if let Some(virtual_index) = virtual_index {
-            let current_inputs = list_sink_inputs()
-                .unwrap_or_default()
-                .into_iter()
-                .map(|input| (input.index, input.sink))
-                .collect::<HashMap<_, _>>();
-
-            for moved in &session.moved_inputs {
-                let still_on_splitter =
-                    current_inputs.get(&moved.input_index) == Some(&virtual_index);
-                let original_exists = sink_names_by_index
-                    .values()
-                    .any(|name| *name == moved.original_sink);
-                if still_on_splitter
-                    && original_exists
-                    && let Err(error) = move_sink_input(moved.input_index, &moved.original_sink)
-                {
-                    errors.push(error.to_string());
-                }
-            }
-        }
-
-        if let Err(error) = unload_module(session.module_index) {
-            errors.push(error.to_string());
-        }
-
-        if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(AudioError::StopFailed(errors.join("; ")))
-        }
-    }
-
-    fn cleanup_owned_modules(fallback: Option<&str>) -> Result<(), AudioError> {
-        let modules = list_modules()?;
-        let stale = modules
-            .into_iter()
-            .filter(|module| {
-                module.name == "module-combine-sink"
-                    && module.argument.as_deref().is_some_and(|arguments| {
-                        arguments
-                            .split_whitespace()
-                            .any(|arg| arg.strip_prefix("sink_name=") == Some(VIRTUAL_SINK_NAME))
-                    })
-            })
-            .filter_map(|module| module.index)
-            .collect::<Vec<_>>();
-
-        if stale.is_empty() {
-            return Ok(());
-        }
-
-        if get_default_sink().ok().as_deref() == Some(VIRTUAL_SINK_NAME) {
-            let fallback = fallback.map(str::to_owned).or_else(|| {
-                list_sinks().ok().and_then(|sinks| {
-                    sinks
+            match self.backend.list_inputs() {
+                Ok(inputs) => {
+                    let originals = session
+                        .moved_inputs
+                        .iter()
+                        .map(|input| (input.input_index, input.original_sink.as_str()))
+                        .collect::<HashMap<_, _>>();
+                    for input in inputs
                         .into_iter()
-                        .find(|sink| sink.name != VIRTUAL_SINK_NAME)
-                        .map(|sink| sink.name)
-                })
-            });
-            if let Some(fallback) = fallback {
-                set_default_sink(&fallback)?;
+                        .filter(|input| input.sink == virtual_index)
+                    {
+                        let destination = originals
+                            .get(&input.index)
+                            .copied()
+                            .filter(|name| available_names.contains(name))
+                            .or(fallback.as_deref());
+                        if let Some(destination) = destination
+                            && let Err(error) = self.backend.move_input(input.index, destination)
+                        {
+                            warnings.push(error.to_string());
+                        }
+                    }
+                }
+                Err(error) => warnings.push(error.to_string()),
             }
         }
 
-        for module_index in stale {
-            unload_module(module_index)?;
+        let mut module_indices = match self.backend.list_modules() {
+            Ok(modules) => owned_module_indices(&modules),
+            Err(error) => {
+                warnings.push(error.to_string());
+                session.module_index.into_iter().collect()
+            }
+        };
+        if let Some(module_index) = session.module_index
+            && !module_indices.contains(&module_index)
+            && virtual_index.is_some()
+        {
+            module_indices.push(module_index);
+        }
+        for module_index in module_indices {
+            if let Err(error) = self.backend.unload_module(module_index) {
+                warnings.push(error.to_string());
+            }
+        }
+
+        let final_sinks = self.backend.list_sinks().map_err(|error| {
+            AudioError::StopFailed(format!("could not verify recovered outputs: {error}"))
+        })?;
+        let virtual_remains = final_sinks
+            .iter()
+            .any(|sink| sink.name == VIRTUAL_SINK_NAME);
+        let mut default_is_virtual =
+            self.backend.default_sink().ok().as_deref() == Some(VIRTUAL_SINK_NAME);
+        if default_is_virtual
+            && let Some(fallback) = choose_fallback(session, &final_sinks)
+            && self.backend.set_default_sink(&fallback).is_ok()
+        {
+            default_is_virtual =
+                self.backend.default_sink().ok().as_deref() == Some(VIRTUAL_SINK_NAME);
+        }
+
+        if virtual_remains || default_is_virtual {
+            warnings.push("the temporary output is still active after recovery".to_owned());
+            return Err(AudioError::StopFailed(warnings.join("; ")));
+        }
+
+        self.store.clear()?;
+        for warning in warnings {
+            tracing::warn!(%warning, "non-fatal audio recovery warning");
         }
         Ok(())
     }
+
+    fn cleanup_owned_modules(&self, preferred_fallback: Option<&str>) -> Result<usize, AudioError> {
+        let modules = self.backend.list_modules()?;
+        let owned = owned_module_indices(&modules);
+        if owned.is_empty() {
+            return Ok(0);
+        }
+
+        let session = SplitSession {
+            module_index: owned.first().copied(),
+            previous_default: preferred_fallback.map(str::to_owned),
+            outputs: preferred_fallback.into_iter().map(str::to_owned).collect(),
+            moved_inputs: Vec::new(),
+            phase: SessionPhase::Stopping,
+        };
+        self.stop_transaction(&session)?;
+        Ok(owned.len())
+    }
+
+    fn wait_for_sink(&self, name: &str) -> Result<(), AudioError> {
+        for _ in 0..20 {
+            if self
+                .backend
+                .list_sinks()?
+                .iter()
+                .any(|sink| sink.name == name)
+            {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        Err(AudioError::Command(
+            "the split output did not appear in PipeWire".to_owned(),
+        ))
+    }
+
+    fn ensure_pipewire(&self) -> Result<(), AudioError> {
+        let server_name = self.backend.server_name()?;
+        if server_name.to_ascii_lowercase().contains("pipewire") {
+            Ok(())
+        } else {
+            Err(AudioError::UnsupportedServer(server_name))
+        }
+    }
 }
 
-fn to_audio_device(sink: PactlSink) -> AudioDevice {
-    let icon_name = string_property(&sink.properties, "device.icon_name")
-        .unwrap_or("audio-speakers-symbolic")
-        .to_owned();
+fn choose_fallback(session: &SplitSession, sinks: &[SinkRecord]) -> Option<String> {
+    let available = sinks
+        .iter()
+        .filter(|sink| sink.name != VIRTUAL_SINK_NAME)
+        .map(|sink| sink.name.as_str())
+        .collect::<HashSet<_>>();
+    session
+        .previous_default
+        .as_deref()
+        .filter(|name| available.contains(name))
+        .or_else(|| {
+            session
+                .outputs
+                .iter()
+                .map(String::as_str)
+                .find(|name| available.contains(name))
+        })
+        .or_else(|| {
+            sinks
+                .iter()
+                .find(|sink| sink.name != VIRTUAL_SINK_NAME)
+                .map(|sink| sink.name.as_str())
+        })
+        .map(str::to_owned)
+}
+
+fn owned_module_indices(modules: &[ModuleRecord]) -> Vec<u32> {
+    modules
+        .iter()
+        .filter(|module| {
+            module.name == "module-combine-sink"
+                && module.argument.as_deref().is_some_and(|arguments| {
+                    arguments
+                        .split_whitespace()
+                        .any(|arg| arg.strip_prefix("sink_name=") == Some(VIRTUAL_SINK_NAME))
+                })
+        })
+        .filter_map(|module| module.index)
+        .collect()
+}
+
+fn to_audio_device(sink: SinkRecord) -> AudioDevice {
     let description = sink
         .description
         .filter(|description| !description.trim().is_empty())
@@ -359,120 +578,15 @@ fn to_audio_device(sink: PactlSink) -> AudioDevice {
             || state.to_owned(),
             |specification| format!("{state} · {specification}"),
         );
-    let volume_percent = average_volume_percent(&sink.volume);
 
     AudioDevice {
         index: sink.index,
         name: sink.name,
         description,
         detail,
-        icon_name,
-        volume_percent,
+        icon_name: sink.icon_name,
+        volume_percent: sink.volume_percent,
     }
-}
-
-fn average_volume_percent(volume: &HashMap<String, PactlChannelVolume>) -> u32 {
-    let percentages = volume
-        .values()
-        .filter_map(|channel| {
-            channel
-                .value_percent
-                .trim_end_matches('%')
-                .parse::<u32>()
-                .ok()
-        })
-        .collect::<Vec<_>>();
-
-    if percentages.is_empty() {
-        100
-    } else {
-        (percentages.iter().sum::<u32>() / percentages.len() as u32).min(100)
-    }
-}
-
-fn string_property<'a>(properties: &'a HashMap<String, Value>, key: &str) -> Option<&'a str> {
-    properties.get(key).and_then(Value::as_str)
-}
-
-fn list_sinks() -> Result<Vec<PactlSink>, AudioError> {
-    parse_json(&run_pactl(&[
-        "--format=json".to_owned(),
-        "list".to_owned(),
-        "sinks".to_owned(),
-    ])?)
-}
-
-fn list_modules() -> Result<Vec<PactlModule>, AudioError> {
-    parse_json(&run_pactl(&[
-        "--format=json".to_owned(),
-        "list".to_owned(),
-        "modules".to_owned(),
-    ])?)
-}
-
-fn list_sink_inputs() -> Result<Vec<PactlSinkInput>, AudioError> {
-    parse_json(&run_pactl(&[
-        "--format=json".to_owned(),
-        "list".to_owned(),
-        "sink-inputs".to_owned(),
-    ])?)
-}
-
-fn parse_json<T: for<'de> Deserialize<'de>>(value: &str) -> Result<T, AudioError> {
-    serde_json::from_str(value).map_err(|error| AudioError::InvalidData(error.to_string()))
-}
-
-fn get_default_sink() -> Result<String, AudioError> {
-    let value = run_pactl(&["get-default-sink".to_owned()])?;
-    let value = value.trim();
-    if value.is_empty() {
-        Err(AudioError::InvalidData(
-            "default output was empty".to_owned(),
-        ))
-    } else {
-        Ok(value.to_owned())
-    }
-}
-
-fn set_default_sink(name: &str) -> Result<(), AudioError> {
-    run_pactl(&["set-default-sink".to_owned(), name.to_owned()]).map(|_| ())
-}
-
-fn move_sink_input(index: u32, sink: &str) -> Result<(), AudioError> {
-    run_pactl(&[
-        "move-sink-input".to_owned(),
-        index.to_string(),
-        sink.to_owned(),
-    ])
-    .map(|_| ())
-}
-
-fn unload_module(index: u32) -> Result<(), AudioError> {
-    run_pactl(&["unload-module".to_owned(), index.to_string()]).map(|_| ())
-}
-
-fn wait_for_sink(name: &str) -> Result<(), AudioError> {
-    for _ in 0..10 {
-        if list_sinks()?.iter().any(|sink| sink.name == name) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-
-    Err(AudioError::Command(
-        "the split output did not appear in PipeWire".to_owned(),
-    ))
-}
-
-fn module_arguments(outputs: &[String], latency_compensation: bool) -> Vec<String> {
-    vec![
-        "load-module".to_owned(),
-        "module-combine-sink".to_owned(),
-        format!("sink_name={VIRTUAL_SINK_NAME}"),
-        format!("sinks={}", outputs.join(",")),
-        format!("sink_properties='device.description=\"{VIRTUAL_SINK_DESCRIPTION}\"'"),
-        format!("latency_compensate={latency_compensation}"),
-    ]
 }
 
 fn is_safe_pulse_name(name: &str) -> bool {
@@ -483,116 +597,333 @@ fn is_safe_pulse_name(name: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
-fn run_pactl(args: &[String]) -> Result<String, AudioError> {
-    let output = Command::new("pactl")
-        .args(args)
-        .env("LC_ALL", "C")
-        .output()
-        .map_err(|error| AudioError::Unavailable(error.to_string()))?;
-
-    if output.status.success() {
-        String::from_utf8(output.stdout).map_err(|error| AudioError::InvalidData(error.to_string()))
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-        let message = if stderr.is_empty() {
-            format!("pactl exited with {}", output.status)
-        } else {
-            stderr
-        };
-        Err(AudioError::Command(message))
-    }
+fn combine_notices(notices: Vec<String>) -> Option<String> {
+    (!notices.is_empty()).then(|| notices.join(" "))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use journal::JournalLoad;
+    use std::sync::{Arc, Mutex};
 
-    const SINKS_JSON: &str = r#"
-    [
-      {
-        "index": 41,
-        "state": "RUNNING",
-        "name": "alsa_output.usb-DAC.analog-stereo",
-        "description": "USB DAC",
-        "sample_specification": "float32le 2ch 48000Hz",
-        "volume": {
-          "front-left": {"value": 42598, "value_percent": "65%", "db": "-11.21 dB"},
-          "front-right": {"value": 42598, "value_percent": "65%", "db": "-11.21 dB"}
-        },
-        "properties": {"device.icon_name": "audio-card-usb"}
-      },
-      {
-        "index": 42,
-        "state": "SUSPENDED",
-        "name": "alsa_output.pci-HDMI.hdmi-stereo",
-        "description": "Living Room TV",
-        "properties": {}
-      }
-    ]"#;
+    const SPEAKERS: &str = "alsa_output.speakers";
+    const HEADPHONES: &str = "bluez_output.headphones";
 
-    const MODULES_JSON: &str = r#"
-    [
-      {
-        "name": "libpipewire-module-rt",
-        "argument": "{ rt.prio = 60 }",
-        "properties": {"object.id": "1"}
-      },
-      {
-        "index": 536870916,
-        "name": "module-combine-sink",
-        "argument": "sink_name=cosmic_audio_splitter sinks=alsa_output.one,bluez_output.two"
-      }
-    ]"#;
+    #[derive(Clone)]
+    struct FakeBackend {
+        state: Arc<Mutex<FakeState>>,
+    }
 
-    #[test]
-    fn parses_pipewire_sinks() {
-        let sinks: Vec<PactlSink> = parse_json(SINKS_JSON).expect("fixture should parse");
-        let first = to_audio_device(sinks.into_iter().next().expect("one sink"));
+    struct FakeState {
+        server_name: String,
+        sinks: Vec<SinkRecord>,
+        modules: Vec<ModuleRecord>,
+        inputs: Vec<InputRecord>,
+        default_sink: String,
+        fail_once: Option<&'static str>,
+    }
 
-        assert_eq!(first.index, 41);
-        assert_eq!(first.description, "USB DAC");
-        assert_eq!(first.icon_name, "audio-card-usb");
-        assert_eq!(first.detail, "Playing · float32le 2ch 48000Hz");
-        assert_eq!(first.volume_percent, 65);
+    impl FakeBackend {
+        fn healthy() -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeState {
+                    server_name: "PulseAudio (on PipeWire 1.4.8)".to_owned(),
+                    sinks: vec![sink(1, SPEAKERS), sink(2, HEADPHONES)],
+                    modules: Vec::new(),
+                    inputs: vec![InputRecord { index: 10, sink: 1 }],
+                    default_sink: SPEAKERS.to_owned(),
+                    fail_once: None,
+                })),
+            }
+        }
+
+        fn fail_once(&self, operation: &'static str) {
+            self.state.lock().expect("state lock").fail_once = Some(operation);
+        }
+
+        fn maybe_fail(state: &mut FakeState, operation: &'static str) -> Result<(), AudioError> {
+            if state.fail_once == Some(operation) {
+                state.fail_once = None;
+                Err(AudioError::Command(format!("injected {operation} failure")))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    impl AudioBackend for FakeBackend {
+        fn server_name(&self) -> Result<String, AudioError> {
+            Ok(self.state.lock().expect("state lock").server_name.clone())
+        }
+
+        fn list_sinks(&self) -> Result<Vec<SinkRecord>, AudioError> {
+            Ok(self.state.lock().expect("state lock").sinks.clone())
+        }
+
+        fn list_modules(&self) -> Result<Vec<ModuleRecord>, AudioError> {
+            Ok(self.state.lock().expect("state lock").modules.clone())
+        }
+
+        fn list_inputs(&self) -> Result<Vec<InputRecord>, AudioError> {
+            Ok(self.state.lock().expect("state lock").inputs.clone())
+        }
+
+        fn default_sink(&self) -> Result<String, AudioError> {
+            Ok(self.state.lock().expect("state lock").default_sink.clone())
+        }
+
+        fn load_combine_sink(
+            &self,
+            outputs: &[String],
+            _latency_compensation: bool,
+        ) -> Result<u32, AudioError> {
+            let mut state = self.state.lock().expect("state lock");
+            Self::maybe_fail(&mut state, "load")?;
+            state.modules.push(ModuleRecord {
+                index: Some(42),
+                name: "module-combine-sink".to_owned(),
+                argument: Some(format!(
+                    "sink_name={VIRTUAL_SINK_NAME} sinks={}",
+                    outputs.join(",")
+                )),
+            });
+            state.sinks.push(sink(99, VIRTUAL_SINK_NAME));
+            Ok(42)
+        }
+
+        fn set_default_sink(&self, name: &str) -> Result<(), AudioError> {
+            let mut state = self.state.lock().expect("state lock");
+            Self::maybe_fail(&mut state, "set_default")?;
+            state.default_sink = name.to_owned();
+            Ok(())
+        }
+
+        fn move_input(&self, index: u32, sink_name: &str) -> Result<(), AudioError> {
+            let mut state = self.state.lock().expect("state lock");
+            Self::maybe_fail(&mut state, "move")?;
+            let sink_index = state
+                .sinks
+                .iter()
+                .find(|sink| sink.name == sink_name)
+                .map(|sink| sink.index)
+                .ok_or_else(|| AudioError::Command("missing destination".to_owned()))?;
+            if let Some(input) = state.inputs.iter_mut().find(|input| input.index == index) {
+                input.sink = sink_index;
+            }
+            Ok(())
+        }
+
+        fn unload_module(&self, index: u32) -> Result<(), AudioError> {
+            let mut state = self.state.lock().expect("state lock");
+            Self::maybe_fail(&mut state, "unload")?;
+            state.modules.retain(|module| module.index != Some(index));
+            state.sinks.retain(|sink| sink.name != VIRTUAL_SINK_NAME);
+            Ok(())
+        }
+
+        fn set_volume(&self, _name: &str, _volume_percent: u32) -> Result<(), AudioError> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct MemoryStore {
+        session: Arc<Mutex<Option<SplitSession>>>,
+    }
+
+    impl SessionStore for MemoryStore {
+        fn load(&self) -> Result<JournalLoad, AudioError> {
+            Ok(JournalLoad {
+                session: self.session.lock().expect("journal lock").clone(),
+                warning: None,
+            })
+        }
+
+        fn save(&self, session: &SplitSession) -> Result<(), AudioError> {
+            *self.session.lock().expect("journal lock") = Some(session.clone());
+            Ok(())
+        }
+
+        fn clear(&self) -> Result<(), AudioError> {
+            *self.session.lock().expect("journal lock") = None;
+            Ok(())
+        }
+    }
+
+    fn sink(index: u32, name: &str) -> SinkRecord {
+        SinkRecord {
+            index,
+            name: name.to_owned(),
+            description: Some(name.to_owned()),
+            state: Some("IDLE".to_owned()),
+            sample_specification: Some("float32le 2ch 48000Hz".to_owned()),
+            volume_percent: 65,
+            icon_name: "audio-speakers-symbolic".to_owned(),
+        }
+    }
+
+    fn outputs() -> Vec<String> {
+        vec![SPEAKERS.to_owned(), HEADPHONES.to_owned()]
     }
 
     #[test]
-    fn defaults_to_full_volume_when_pipewire_omits_volume_data() {
-        let sinks: Vec<PactlSink> = parse_json(SINKS_JSON).expect("fixture should parse");
-        let second = to_audio_device(sinks.into_iter().nth(1).expect("second sink"));
+    fn start_and_stop_are_a_reversible_transaction() {
+        let backend = FakeBackend::healthy();
+        let store = MemoryStore::default();
+        let service = AudioService::new(backend.clone(), store.clone());
 
-        assert_eq!(second.volume_percent, 100);
+        let outcome = service.start(outputs(), false).expect("start should work");
+        {
+            let state = backend.state.lock().expect("state lock");
+            assert_eq!(state.default_sink, VIRTUAL_SINK_NAME);
+            assert!(
+                state
+                    .sinks
+                    .iter()
+                    .any(|sink| sink.name == VIRTUAL_SINK_NAME)
+            );
+            assert_eq!(state.inputs[0].sink, 99);
+        }
+        assert_eq!(
+            store
+                .session
+                .lock()
+                .expect("journal lock")
+                .as_ref()
+                .map(|value| value.phase),
+            Some(SessionPhase::Active)
+        );
+
+        service.stop(&outcome.session).expect("stop should work");
+        let state = backend.state.lock().expect("state lock");
+        assert_eq!(state.default_sink, SPEAKERS);
+        assert!(
+            !state
+                .sinks
+                .iter()
+                .any(|sink| sink.name == VIRTUAL_SINK_NAME)
+        );
+        assert_eq!(state.inputs[0].sink, 1);
+        assert!(store.session.lock().expect("journal lock").is_none());
     }
 
     #[test]
-    fn accepts_builtin_modules_without_an_index() {
-        let modules: Vec<PactlModule> =
-            parse_json(MODULES_JSON).expect("PipeWire module fixture should parse");
+    fn stop_is_safe_to_repeat() {
+        let backend = FakeBackend::healthy();
+        let store = MemoryStore::default();
+        let service = AudioService::new(backend.clone(), store.clone());
+        let session = service
+            .start(outputs(), false)
+            .expect("start should work")
+            .session;
 
-        assert_eq!(modules[0].index, None);
-        assert_eq!(modules[1].index, Some(536_870_916));
+        service.stop(&session).expect("first stop should work");
+        service.stop(&session).expect("second stop should work");
+
+        let state = backend.state.lock().expect("state lock");
+        assert_eq!(state.default_sink, SPEAKERS);
+        assert!(state.modules.is_empty());
+        assert!(store.session.lock().expect("journal lock").is_none());
     }
 
     #[test]
-    fn module_arguments_target_each_selected_output() {
-        let outputs = vec!["alsa_output.one".to_owned(), "bluez_output.two".to_owned()];
-        let arguments = module_arguments(&outputs, false);
+    fn failed_start_rolls_back_module_and_journal() {
+        let backend = FakeBackend::healthy();
+        backend.fail_once("set_default");
+        let store = MemoryStore::default();
+        let service = AudioService::new(backend.clone(), store.clone());
 
+        let error = service
+            .start(outputs(), false)
+            .expect_err("start should fail");
+        assert!(matches!(error, AudioError::StartFailed(_)));
+        let state = backend.state.lock().expect("state lock");
+        assert_eq!(state.default_sink, SPEAKERS);
+        assert!(state.modules.is_empty());
         assert!(
-            arguments
+            !state
+                .sinks
                 .iter()
-                .any(|arg| arg == "sinks=alsa_output.one,bluez_output.two")
+                .any(|sink| sink.name == VIRTUAL_SINK_NAME)
         );
+        assert!(store.session.lock().expect("journal lock").is_none());
+    }
+
+    #[test]
+    fn prepare_recovers_an_interrupted_active_session() {
+        let backend = FakeBackend::healthy();
+        let store = MemoryStore::default();
+        let service = AudioService::new(backend.clone(), store.clone());
+        let session = service
+            .start(outputs(), true)
+            .expect("start should work")
+            .session;
+        *store.session.lock().expect("journal lock") = Some(session);
+
+        let snapshot = service.prepare().expect("recovery should work");
         assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "sink_properties='device.description=\"Audio Splitter\"'")
+            snapshot
+                .notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Recovered"))
         );
-        assert!(
-            arguments
-                .iter()
-                .any(|arg| arg == "latency_compensate=false")
+        assert!(!snapshot.split_active);
+        assert_eq!(snapshot.default_sink.as_deref(), Some(SPEAKERS));
+        assert!(store.session.lock().expect("journal lock").is_none());
+    }
+
+    #[test]
+    fn prepare_clears_a_journal_after_external_cleanup() {
+        let backend = FakeBackend::healthy();
+        let store = MemoryStore::default();
+        *store.session.lock().expect("journal lock") = Some(SplitSession {
+            module_index: Some(42),
+            previous_default: Some(SPEAKERS.to_owned()),
+            outputs: outputs(),
+            moved_inputs: Vec::new(),
+            phase: SessionPhase::Active,
+        });
+        let service = AudioService::new(backend, store.clone());
+
+        let snapshot = service.prepare().expect("recovery should be idempotent");
+        assert!(!snapshot.split_active);
+        assert!(store.session.lock().expect("journal lock").is_none());
+    }
+
+    #[test]
+    fn stop_uses_an_available_fallback_when_previous_output_disappears() {
+        let backend = FakeBackend::healthy();
+        let store = MemoryStore::default();
+        let service = AudioService::new(backend.clone(), store);
+        let session = service
+            .start(outputs(), false)
+            .expect("start should work")
+            .session;
+        backend
+            .state
+            .lock()
+            .expect("state lock")
+            .sinks
+            .retain(|sink| sink.name != SPEAKERS);
+
+        service.stop(&session).expect("fallback stop should work");
+        assert_eq!(
+            backend.state.lock().expect("state lock").default_sink,
+            HEADPHONES
         );
+    }
+
+    #[test]
+    fn rejects_non_pipewire_servers() {
+        let backend = FakeBackend::healthy();
+        backend.state.lock().expect("state lock").server_name = "pulseaudio".to_owned();
+        let service = AudioService::new(backend, MemoryStore::default());
+
+        assert!(matches!(
+            service.prepare(),
+            Err(AudioError::UnsupportedServer(_))
+        ));
     }
 
     #[test]

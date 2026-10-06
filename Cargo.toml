@@ -5,14 +5,14 @@ edition = "2024"
 rust-version = "1.93"
 license = "MIT"
 description = "Play the same Linux desktop audio through multiple outputs"
-repository = "https://github.com/okrroni/cosmic-audio-spliter"
+repository = "https://github.com/okrroni/splitter"
 
 [dependencies]
 open = "5.3.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.17"
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "time"] }
+tokio = { version = "1.49.0", features = ["io-util", "process", "rt-multi-thread", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 
