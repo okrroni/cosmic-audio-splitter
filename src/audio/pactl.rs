@@ -9,16 +9,18 @@ use cosmic::iced::futures::stream::{self, BoxStream};
 use serde::Deserialize;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Read;
+use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdout, Command as TokioCommand};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(4);
 const MONITOR_RETRY_DELAY: Duration = Duration::from_secs(2);
+const TEST_SAMPLE_NAME: &str = "cosmic_audio_splitter_test";
 
 #[derive(Clone, Debug)]
 pub(super) struct PactlBackend {
@@ -127,6 +129,7 @@ impl AudioBackend for PactlBackend {
                 state: sink.state,
                 sample_specification: sink.sample_specification,
                 volume_percent: average_volume_percent(&sink.volume),
+                muted: sink.mute,
                 icon_name: string_property(&sink.properties, "device.icon_name")
                     .unwrap_or("audio-speakers-symbolic")
                     .to_owned(),
@@ -214,6 +217,37 @@ impl AudioBackend for PactlBackend {
             format!("{}%", volume_percent.min(100)),
         ])
         .map(|_| ())
+    }
+
+    fn set_muted(&self, name: &str, muted: bool) -> Result<(), AudioError> {
+        self.run(&[
+            "set-sink-mute".to_owned(),
+            name.to_owned(),
+            if muted { "1" } else { "0" }.to_owned(),
+        ])
+        .map(|_| ())
+    }
+
+    fn play_test_tone(&self, name: &str) -> Result<(), AudioError> {
+        let sample_path = write_test_tone()?;
+
+        let path = sample_path.to_string_lossy().into_owned();
+        let _ = self.run(&["remove-sample".to_owned(), TEST_SAMPLE_NAME.to_owned()]);
+        let upload = self.run(&[
+            "upload-sample".to_owned(),
+            path,
+            TEST_SAMPLE_NAME.to_owned(),
+        ]);
+        let result = upload.and_then(|_| {
+            self.run(&[
+                "play-sample".to_owned(),
+                TEST_SAMPLE_NAME.to_owned(),
+                name.to_owned(),
+            ])
+        });
+        let _ = self.run(&["remove-sample".to_owned(), TEST_SAMPLE_NAME.to_owned()]);
+        let _ = fs::remove_file(sample_path);
+        result.map(|_| ())
     }
 }
 
@@ -344,6 +378,82 @@ fn string_property<'a>(properties: &'a HashMap<String, Value>, key: &str) -> Opt
     properties.get(key).and_then(Value::as_str)
 }
 
+fn test_tone_wav() -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 48_000;
+    const DURATION_SAMPLES: u32 = SAMPLE_RATE * 3 / 10;
+    const CHANNELS: u16 = 1;
+    const BITS_PER_SAMPLE: u16 = 16;
+    const AMPLITUDE: f32 = 0.22;
+
+    let data_size = DURATION_SAMPLES * u32::from(CHANNELS) * u32::from(BITS_PER_SAMPLE / 8);
+    let mut wav = Vec::with_capacity((44 + data_size) as usize);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_size).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16_u32.to_le_bytes());
+    wav.extend_from_slice(&1_u16.to_le_bytes());
+    wav.extend_from_slice(&CHANNELS.to_le_bytes());
+    wav.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    let byte_rate = SAMPLE_RATE * u32::from(CHANNELS) * u32::from(BITS_PER_SAMPLE / 8);
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&(CHANNELS * BITS_PER_SAMPLE / 8).to_le_bytes());
+    wav.extend_from_slice(&BITS_PER_SAMPLE.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+
+    for sample_index in 0..DURATION_SAMPLES {
+        let time = sample_index as f32 / SAMPLE_RATE as f32;
+        let edge = 1_200_u32;
+        let envelope = if sample_index < edge {
+            sample_index as f32 / edge as f32
+        } else if sample_index > DURATION_SAMPLES - edge {
+            (DURATION_SAMPLES - sample_index) as f32 / edge as f32
+        } else {
+            1.0
+        };
+        let wave = (std::f32::consts::TAU * 660.0 * time).sin();
+        let sample = (wave * envelope * AMPLITUDE * i16::MAX as f32) as i16;
+        wav.extend_from_slice(&sample.to_le_bytes());
+    }
+    wav
+}
+
+fn write_test_tone() -> Result<PathBuf, AudioError> {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let bytes = test_tone_wav();
+
+    for attempt in 0..8 {
+        let path = std::env::temp_dir().join(format!(
+            "cosmic-audio-splitter-test-{}-{unique}-{attempt}.wav",
+            std::process::id()
+        ));
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(error) = file.write_all(&bytes) {
+                    let _ = fs::remove_file(&path);
+                    return Err(AudioError::Command(format!(
+                        "could not create test tone: {error}"
+                    )));
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(AudioError::Command(format!(
+                    "could not create test tone: {error}"
+                )));
+            }
+        }
+    }
+
+    Err(AudioError::Command(
+        "could not allocate a temporary test tone file".to_owned(),
+    ))
+}
+
 #[derive(Debug, Deserialize)]
 struct PactlSink {
     index: u32,
@@ -353,6 +463,8 @@ struct PactlSink {
     sample_specification: Option<String>,
     #[serde(default)]
     volume: HashMap<String, PactlChannelVolume>,
+    #[serde(default)]
+    mute: bool,
     #[serde(default)]
     properties: HashMap<String, Value>,
 }
@@ -386,6 +498,7 @@ mod tests {
         "state": "RUNNING",
         "name": "alsa_output.usb-DAC.analog-stereo",
         "description": "USB DAC",
+        "mute": false,
         "sample_specification": "float32le 2ch 48000Hz",
         "volume": {
           "front-left": {"value_percent": "65%"},
@@ -398,6 +511,7 @@ mod tests {
         "state": "SUSPENDED",
         "name": "alsa_output.pci-HDMI.hdmi-stereo",
         "description": "Living Room TV",
+        "mute": true,
         "properties": {}
       }
     ]"#;
@@ -431,6 +545,8 @@ mod tests {
         assert_eq!(sinks[0].description.as_deref(), Some("USB DAC"));
         assert_eq!(average_volume_percent(&sinks[0].volume), 65);
         assert_eq!(average_volume_percent(&sinks[1].volume), 100);
+        assert!(!sinks[0].mute);
+        assert!(sinks[1].mute);
     }
 
     #[test]
@@ -448,5 +564,16 @@ mod tests {
             .run(&["-c".to_owned(), "sleep 1".to_owned()])
             .expect_err("command should time out");
         assert!(matches!(error, AudioError::Timeout(_)));
+    }
+
+    #[test]
+    fn generated_test_tone_is_a_valid_pcm_wave() {
+        let wav = test_tone_wav();
+
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 48_000);
+        assert!(wav.len() > 44);
     }
 }

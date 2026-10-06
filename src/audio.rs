@@ -30,6 +30,14 @@ pub struct AudioDevice {
     pub detail: String,
     pub icon_name: String,
     pub volume_percent: u32,
+    pub muted: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputControl {
+    pub name: String,
+    pub volume_percent: u32,
+    pub muted: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -103,6 +111,7 @@ pub(super) struct SinkRecord {
     state: Option<String>,
     sample_specification: Option<String>,
     volume_percent: u32,
+    muted: bool,
     icon_name: String,
 }
 
@@ -134,6 +143,8 @@ pub(super) trait AudioBackend {
     fn move_input(&self, index: u32, sink: &str) -> Result<(), AudioError>;
     fn unload_module(&self, index: u32) -> Result<(), AudioError>;
     fn set_volume(&self, name: &str, volume_percent: u32) -> Result<(), AudioError>;
+    fn set_muted(&self, name: &str, muted: bool) -> Result<(), AudioError>;
+    fn play_test_tone(&self, name: &str) -> Result<(), AudioError>;
 }
 
 pub struct AudioController;
@@ -166,6 +177,26 @@ impl AudioController {
             return Err(AudioError::UnsafeName(name.to_owned()));
         }
         PactlBackend::default().set_volume(name, volume_percent)
+    }
+
+    pub fn set_muted(name: &str, muted: bool) -> Result<(), AudioError> {
+        if !is_safe_pulse_name(name) {
+            return Err(AudioError::UnsafeName(name.to_owned()));
+        }
+        PactlBackend::default().set_muted(name, muted)
+    }
+
+    pub fn configure_outputs(controls: &[OutputControl]) -> Result<(), AudioError> {
+        let _guard = transaction_guard()?;
+        system_service()?.configure_outputs(controls)
+    }
+
+    pub fn test_output(name: &str) -> Result<(), AudioError> {
+        let _guard = transaction_guard()?;
+        if !is_safe_pulse_name(name) {
+            return Err(AudioError::UnsafeName(name.to_owned()));
+        }
+        system_service()?.test_output(name)
     }
 
     pub fn subscription() -> Subscription<()> {
@@ -240,6 +271,42 @@ impl<B: AudioBackend, S: SessionStore> AudioService<B, S> {
             split_active,
             notice: None,
         })
+    }
+
+    fn configure_outputs(&self, controls: &[OutputControl]) -> Result<(), AudioError> {
+        self.ensure_pipewire()?;
+        let available = self
+            .backend
+            .list_sinks()?
+            .into_iter()
+            .map(|sink| sink.name)
+            .collect::<HashSet<_>>();
+
+        for control in controls {
+            if !is_safe_pulse_name(&control.name) {
+                return Err(AudioError::UnsafeName(control.name.clone()));
+            }
+            if !available.contains(&control.name) {
+                return Err(AudioError::MissingOutputs(control.name.clone()));
+            }
+            self.backend
+                .set_volume(&control.name, control.volume_percent.min(100))?;
+            self.backend.set_muted(&control.name, control.muted)?;
+        }
+        Ok(())
+    }
+
+    fn test_output(&self, name: &str) -> Result<(), AudioError> {
+        self.ensure_pipewire()?;
+        let available = self
+            .backend
+            .list_sinks()?
+            .into_iter()
+            .any(|sink| sink.name == name);
+        if !available {
+            return Err(AudioError::MissingOutputs(name.to_owned()));
+        }
+        self.backend.play_test_tone(name)
     }
 
     fn start(
@@ -586,6 +653,7 @@ fn to_audio_device(sink: SinkRecord) -> AudioDevice {
         detail,
         icon_name: sink.icon_name,
         volume_percent: sink.volume_percent,
+        muted: sink.muted,
     }
 }
 
@@ -722,8 +790,43 @@ mod tests {
             Ok(())
         }
 
-        fn set_volume(&self, _name: &str, _volume_percent: u32) -> Result<(), AudioError> {
+        fn set_volume(&self, name: &str, volume_percent: u32) -> Result<(), AudioError> {
+            let mut state = self.state.lock().expect("state lock");
+            Self::maybe_fail(&mut state, "set_volume")?;
+            let sink = state
+                .sinks
+                .iter_mut()
+                .find(|sink| sink.name == name)
+                .ok_or_else(|| AudioError::MissingOutputs(name.to_owned()))?;
+            sink.volume_percent = volume_percent.min(100);
             Ok(())
+        }
+
+        fn set_muted(&self, name: &str, muted: bool) -> Result<(), AudioError> {
+            let mut state = self.state.lock().expect("state lock");
+            Self::maybe_fail(&mut state, "set_muted")?;
+            let sink = state
+                .sinks
+                .iter_mut()
+                .find(|sink| sink.name == name)
+                .ok_or_else(|| AudioError::MissingOutputs(name.to_owned()))?;
+            sink.muted = muted;
+            Ok(())
+        }
+
+        fn play_test_tone(&self, name: &str) -> Result<(), AudioError> {
+            if self
+                .state
+                .lock()
+                .expect("state lock")
+                .sinks
+                .iter()
+                .any(|sink| sink.name == name)
+            {
+                Ok(())
+            } else {
+                Err(AudioError::MissingOutputs(name.to_owned()))
+            }
         }
     }
 
@@ -759,6 +862,7 @@ mod tests {
             state: Some("IDLE".to_owned()),
             sample_specification: Some("float32le 2ch 48000Hz".to_owned()),
             volume_percent: 65,
+            muted: false,
             icon_name: "audio-speakers-symbolic".to_owned(),
         }
     }
@@ -934,5 +1038,38 @@ mod tests {
         assert!(!is_safe_pulse_name("output with spaces"));
         assert!(!is_safe_pulse_name("output;bad"));
         assert!(!is_safe_pulse_name(VIRTUAL_SINK_NAME));
+    }
+
+    #[test]
+    fn output_controls_are_validated_and_applied() {
+        let backend = FakeBackend::healthy();
+        let service = AudioService::new(backend.clone(), MemoryStore::default());
+
+        service
+            .configure_outputs(&[OutputControl {
+                name: HEADPHONES.to_owned(),
+                volume_percent: 150,
+                muted: true,
+            }])
+            .expect("available output should be configured");
+
+        let state = backend.state.lock().expect("state lock");
+        let headphones = state
+            .sinks
+            .iter()
+            .find(|sink| sink.name == HEADPHONES)
+            .expect("headphones");
+        assert_eq!(headphones.volume_percent, 100);
+        assert!(headphones.muted);
+    }
+
+    #[test]
+    fn test_tone_rejects_a_disconnected_output() {
+        let service = AudioService::new(FakeBackend::healthy(), MemoryStore::default());
+
+        assert!(matches!(
+            service.test_output("alsa_output.missing"),
+            Err(AudioError::MissingOutputs(_))
+        ));
     }
 }

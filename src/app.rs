@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 
-use crate::audio::{AudioController, AudioDevice, AudioSnapshot, SplitSession, StartOutcome};
-use crate::config::AppConfig;
+use crate::audio::{
+    AudioController, AudioDevice, AudioSnapshot, OutputControl, SplitSession, StartOutcome,
+};
+use crate::config::{AppConfig, AudioPreset, PresetOutput};
 use cosmic::app::{Task, context_drawer};
 use cosmic::iced::alignment::Horizontal;
 use cosmic::iced::{Length, Subscription};
@@ -9,8 +11,9 @@ use cosmic::prelude::*;
 use cosmic::widget::{self, about::About, icon, settings};
 use std::collections::HashSet;
 
-const APP_ICON: &[u8] =
-    include_bytes!("../resources/icons/hicolor/scalable/apps/io.github.okrroni.splitter.svg");
+const APP_ICON: &[u8] = include_bytes!(
+    "../resources/icons/hicolor/scalable/apps/io.github.okrroni.cosmic_audio_splitter.svg"
+);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ContextPage {
@@ -30,16 +33,24 @@ enum Busy {
 pub enum Message {
     AudioChanged,
     DevicesLoaded(Result<AudioSnapshot, String>),
+    DeviceMuteSet(String, bool, Result<(), String>),
     DeviceVolumeChanged(String, u32),
     DeviceVolumeSet(Result<(), String>),
     DismissNotice,
     LaunchUrl(String),
+    ApplyPreset(usize),
+    DeletePreset(usize),
+    PresetNameChanged(String),
     Refresh,
+    SavePreset,
     Start,
     Started(Result<StartOutcome, String>),
     Stop,
     Stopped(Result<(), String>),
     SetDeviceVolume(String),
+    SetDeviceMuted(String, bool),
+    TestOutput(String),
+    OutputTested(Result<(), String>),
     ToggleContextPage(ContextPage),
     ToggleLatencyCompensation(bool),
     ToggleOutput(String, bool),
@@ -54,6 +65,9 @@ pub struct AppModel {
     default_sink: Option<String>,
     session: Option<SplitSession>,
     busy: Option<Busy>,
+    testing_output: Option<String>,
+    preset_name: String,
+    pending_preset: Option<AudioPreset>,
     notice: Option<String>,
 }
 
@@ -62,7 +76,7 @@ impl cosmic::Application for AppModel {
     type Flags = crate::Flags;
     type Message = Message;
 
-    const APP_ID: &'static str = "io.github.okrroni.splitter";
+    const APP_ID: &'static str = "io.github.okrroni.cosmic_audio_splitter";
 
     fn core(&self) -> &cosmic::Core {
         &self.core
@@ -89,6 +103,9 @@ impl cosmic::Application for AppModel {
             default_sink: None,
             session: None,
             busy: Some(Busy::Loading),
+            testing_output: None,
+            preset_name: String::new(),
+            pending_preset: None,
             notice: None,
         };
         app.set_header_title("Audio Splitter".into());
@@ -137,7 +154,7 @@ impl cosmic::Application for AppModel {
         let selected = self.present_selection();
         let selected_count = selected.len();
         let is_active = self.session.is_some();
-        let is_busy = self.busy.is_some();
+        let is_busy = self.busy.is_some() || self.testing_output.is_some();
 
         let intro = widget::column::with_capacity(2)
             .push(widget::text::title1("Play audio everywhere"))
@@ -183,7 +200,7 @@ impl cosmic::Application for AppModel {
             );
             status_icon = "audio-volume-high-symbolic";
             status_control = widget::button::destructive("Stop")
-                .on_press(Message::Stop)
+                .on_press_maybe((!is_busy).then_some(Message::Stop))
                 .into();
         } else {
             status_title = if selected_count >= 2 {
@@ -198,7 +215,7 @@ impl cosmic::Application for AppModel {
             };
             status_icon = "audio-speakers-symbolic";
             status_control = widget::button::suggested("Start splitting")
-                .on_press_maybe((selected_count >= 2).then_some(Message::Start))
+                .on_press_maybe((selected_count >= 2 && !is_busy).then_some(Message::Start))
                 .into();
         }
 
@@ -227,20 +244,34 @@ impl cosmic::Application for AppModel {
             } else {
                 ""
             };
-            let description = format!("{}{default_suffix}", device.detail);
+            let mute_suffix = if device.muted { " · Muted" } else { "" };
+            let description = format!("{}{default_suffix}{mute_suffix}", device.detail);
             let item = settings::item::builder(device.description.clone())
                 .description(description)
                 .icon(icon::from_name(device.icon_name.clone()).size(24).icon());
+
+            let test_label = if self.testing_output.as_deref() == Some(device.name.as_str()) {
+                "Playing…"
+            } else {
+                "Test"
+            };
+            let test = widget::button::standard(test_label).on_press_maybe(
+                (!is_busy && !device.muted).then(|| Message::TestOutput(name.clone())),
+            );
 
             outputs = if is_active && !is_busy && checked {
                 let change_name = name.clone();
                 let slider = widget::slider(0..=100, device.volume_percent, move |value| {
                     Message::DeviceVolumeChanged(change_name.clone(), value)
                 })
-                .on_release(Message::SetDeviceVolume(name))
-                .width(Length::Fixed(160.0));
-                let controls = widget::row::with_capacity(3)
+                .on_release(Message::SetDeviceVolume(name.clone()))
+                .width(Length::Fixed(130.0));
+                let mute = widget::button::standard(if device.muted { "Unmute" } else { "Mute" })
+                    .on_press(Message::SetDeviceMuted(name.clone(), !device.muted));
+                let controls = widget::row::with_capacity(6)
                     .push(widget::checkbox(true))
+                    .push(test)
+                    .push(mute)
                     .push(slider)
                     .push(
                         widget::text::caption(format!("{}%", device.volume_percent))
@@ -250,12 +281,81 @@ impl cosmic::Application for AppModel {
                     .align_y(cosmic::iced::Alignment::Center);
                 outputs.add(item.control(controls))
             } else if is_active || is_busy {
-                outputs.add(item.control(widget::checkbox(checked)))
+                outputs.add(
+                    item.control(
+                        widget::row::with_capacity(2)
+                            .push(widget::checkbox(checked))
+                            .push(test)
+                            .spacing(spacing.space_xs)
+                            .align_y(cosmic::iced::Alignment::Center),
+                    ),
+                )
             } else {
-                outputs.add(item.checkbox(checked, move |value| {
-                    Message::ToggleOutput(name.clone(), value)
-                }))
+                let toggle_name = name.clone();
+                outputs.add(
+                    item.control(
+                        widget::row::with_capacity(2)
+                            .push(widget::checkbox(checked).on_toggle(move |value| {
+                                Message::ToggleOutput(toggle_name.clone(), value)
+                            }))
+                            .push(test)
+                            .spacing(spacing.space_xs)
+                            .align_y(cosmic::iced::Alignment::Center),
+                    ),
+                )
             };
+        }
+
+        let save_preset = widget::row::with_capacity(2)
+            .push(
+                widget::text_input::text_input("Preset name", &self.preset_name)
+                    .on_input(Message::PresetNameChanged)
+                    .on_submit(|_| Message::SavePreset)
+                    .width(Length::Fixed(190.0)),
+            )
+            .push(
+                widget::button::standard("Save")
+                    .on_press_maybe((!is_active && !is_busy).then_some(Message::SavePreset)),
+            )
+            .spacing(spacing.space_xs)
+            .align_y(cosmic::iced::Alignment::Center);
+        let mut presets = settings::section().title("Presets").add(
+            settings::item::builder("Save current setup")
+                .description(
+                    "Stores selected outputs, their levels, mute state, and delay setting.",
+                )
+                .icon(icon::from_name("document-save-symbolic").size(24).icon())
+                .control(save_preset),
+        );
+        for (index, preset) in self.config.presets.iter().enumerate() {
+            let available = preset
+                .outputs
+                .iter()
+                .filter(|output| self.devices.iter().any(|device| device.name == output.name))
+                .count();
+            let description = format!(
+                "{available}/{} outputs available · delay compensation {}",
+                preset.outputs.len(),
+                if preset.latency_compensation {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
+            let controls = widget::row::with_capacity(2)
+                .push(widget::button::standard("Apply").on_press_maybe(
+                    (!is_active && !is_busy).then_some(Message::ApplyPreset(index)),
+                ))
+                .push(widget::button::standard("Delete").on_press_maybe(
+                    (!is_active && !is_busy).then_some(Message::DeletePreset(index)),
+                ))
+                .spacing(spacing.space_xs);
+            presets = presets.add(
+                settings::item::builder(preset.name.clone())
+                    .description(description)
+                    .icon(icon::from_name("audio-speakers-symbolic").size(24).icon())
+                    .control(controls),
+            );
         }
 
         let advanced = settings::section().title("Advanced").add(
@@ -269,8 +369,13 @@ impl cosmic::Application for AppModel {
                 ),
         );
 
-        let mut sections: Vec<Element<'_, Message>> =
-            vec![intro.into(), status.into(), outputs.into(), advanced.into()];
+        let mut sections: Vec<Element<'_, Message>> = vec![
+            intro.into(),
+            status.into(),
+            outputs.into(),
+            presets.into(),
+            advanced.into(),
+        ];
 
         if let Some(notice) = &self.notice {
             sections.insert(
@@ -304,7 +409,7 @@ impl cosmic::Application for AppModel {
     fn update(&mut self, message: Self::Message) -> Task<Self::Message> {
         match message {
             Message::AudioChanged => {
-                if self.busy.is_none() {
+                if self.busy.is_none() && self.testing_output.is_none() {
                     self.busy = Some(Busy::Refreshing);
                     return discover_task(false);
                 }
@@ -317,6 +422,7 @@ impl cosmic::Application for AppModel {
                         let recovery_notice = snapshot.notice;
                         self.devices = snapshot.devices;
                         self.default_sink = snapshot.default_sink;
+                        self.reapply_pending_preset();
                         self.initialize_selection();
 
                         if let Some(notice) = recovery_notice {
@@ -360,6 +466,17 @@ impl cosmic::Application for AppModel {
                     }
                 }
             }
+            Message::DeviceMuteSet(name, muted, result) => match result {
+                Ok(()) => {
+                    if let Some(device) = self.devices.iter_mut().find(|device| device.name == name)
+                    {
+                        device.muted = muted;
+                    }
+                }
+                Err(error) => {
+                    self.notice = Some(format!("Could not change device mute state: {error}"));
+                }
+            },
             Message::DeviceVolumeChanged(name, volume_percent) => {
                 if let Some(device) = self.devices.iter_mut().find(|device| device.name == name) {
                     device.volume_percent = volume_percent;
@@ -376,21 +493,49 @@ impl cosmic::Application for AppModel {
                     self.notice = Some(format!("Could not open {url}: {error}"));
                 }
             }
+            Message::ApplyPreset(index) => {
+                if self.busy.is_none() && self.session.is_none() {
+                    self.apply_preset(index);
+                }
+            }
+            Message::DeletePreset(index) => {
+                if self.busy.is_none()
+                    && self.session.is_none()
+                    && index < self.config.presets.len()
+                {
+                    self.config.presets.remove(index);
+                    self.save_config();
+                }
+            }
+            Message::PresetNameChanged(value) => {
+                self.preset_name = value.chars().take(64).collect();
+            }
             Message::Refresh => {
                 if self.busy.is_none() {
                     self.busy = Some(Busy::Refreshing);
                     return discover_task(false);
                 }
             }
+            Message::SavePreset => {
+                if self.busy.is_none() && self.session.is_none() {
+                    self.save_current_preset();
+                }
+            }
             Message::Start => {
                 let outputs = self.present_selection();
-                if self.busy.is_none() && self.session.is_none() && outputs.len() >= 2 {
+                if self.busy.is_none()
+                    && self.testing_output.is_none()
+                    && self.session.is_none()
+                    && outputs.len() >= 2
+                {
                     self.busy = Some(Busy::Starting);
                     self.notice = None;
                     let latency_compensation = self.config.latency_compensation;
+                    let controls = self.output_controls(&outputs);
                     return cosmic::task::future(async move {
                         Message::Started(
                             run_blocking(move || {
+                                AudioController::configure_outputs(&controls)?;
                                 AudioController::start(outputs, latency_compensation)
                             })
                             .await,
@@ -404,6 +549,7 @@ impl cosmic::Application for AppModel {
                     Ok(outcome) => {
                         self.notice = outcome.warning;
                         self.session = Some(outcome.session);
+                        self.pending_preset = None;
                     }
                     Err(error) => self.notice = Some(error),
                 }
@@ -450,6 +596,38 @@ impl cosmic::Application for AppModel {
                     });
                 }
             }
+            Message::SetDeviceMuted(name, muted) => {
+                let is_active_output = self
+                    .session
+                    .as_ref()
+                    .is_some_and(|session| session.outputs.iter().any(|output| output == &name));
+                if self.busy.is_none() && is_active_output {
+                    let result_name = name.clone();
+                    return cosmic::task::future(async move {
+                        Message::DeviceMuteSet(
+                            result_name,
+                            muted,
+                            run_blocking(move || AudioController::set_muted(&name, muted)).await,
+                        )
+                    });
+                }
+            }
+            Message::TestOutput(name) => {
+                if self.busy.is_none() && self.testing_output.is_none() {
+                    self.testing_output = Some(name.clone());
+                    return cosmic::task::future(async move {
+                        Message::OutputTested(
+                            run_blocking(move || AudioController::test_output(&name)).await,
+                        )
+                    });
+                }
+            }
+            Message::OutputTested(result) => {
+                self.testing_output = None;
+                if let Err(error) = result {
+                    self.notice = Some(format!("Could not play the output test: {error}"));
+                }
+            }
             Message::ToggleContextPage(page) => {
                 if self.context_page == page {
                     self.core.window.show_context = !self.core.window.show_context;
@@ -463,6 +641,7 @@ impl cosmic::Application for AppModel {
                 self.save_config();
             }
             Message::ToggleOutput(name, selected) => {
+                self.pending_preset = None;
                 if selected {
                     if !self.config.selected_outputs.contains(&name) {
                         self.config.selected_outputs.push(name);
@@ -487,6 +666,109 @@ impl cosmic::Application for AppModel {
 }
 
 impl AppModel {
+    fn output_controls(&self, outputs: &[String]) -> Vec<OutputControl> {
+        let selected = outputs.iter().map(String::as_str).collect::<HashSet<_>>();
+        self.devices
+            .iter()
+            .filter(|device| selected.contains(device.name.as_str()))
+            .map(|device| OutputControl {
+                name: device.name.clone(),
+                volume_percent: device.volume_percent,
+                muted: device.muted,
+            })
+            .collect()
+    }
+
+    fn reapply_pending_preset(&mut self) {
+        let Some(preset) = &self.pending_preset else {
+            return;
+        };
+        for output in &preset.outputs {
+            if let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.name == output.name)
+            {
+                device.volume_percent = output.volume_percent.min(100);
+                device.muted = output.muted;
+            }
+        }
+    }
+
+    fn save_current_preset(&mut self) {
+        let selected = self.present_selection();
+        let outputs = selected
+            .iter()
+            .filter_map(|name| {
+                self.devices
+                    .iter()
+                    .find(|device| &device.name == name)
+                    .map(|device| PresetOutput {
+                        name: device.name.clone(),
+                        volume_percent: device.volume_percent,
+                        muted: device.muted,
+                    })
+            })
+            .collect();
+        let preset = AudioPreset {
+            name: self.preset_name.clone(),
+            outputs,
+            latency_compensation: self.config.latency_compensation,
+        };
+
+        match self.config.upsert_preset(preset) {
+            Ok(()) => {
+                self.preset_name.clear();
+                self.save_config();
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    fn apply_preset(&mut self, index: usize) {
+        let Some(preset) = self.config.presets.get(index).cloned() else {
+            return;
+        };
+        let available = self
+            .devices
+            .iter()
+            .map(|device| device.name.as_str())
+            .collect::<HashSet<_>>();
+        let missing = preset
+            .outputs
+            .iter()
+            .filter(|output| !available.contains(output.name.as_str()))
+            .map(|output| output.name.clone())
+            .collect::<Vec<_>>();
+
+        self.config.selected_outputs = preset
+            .outputs
+            .iter()
+            .map(|output| output.name.clone())
+            .collect();
+        self.config.latency_compensation = preset.latency_compensation;
+        self.config.selection_initialized = true;
+        for output in &preset.outputs {
+            if let Some(device) = self
+                .devices
+                .iter_mut()
+                .find(|device| device.name == output.name)
+            {
+                device.volume_percent = output.volume_percent.min(100);
+                device.muted = output.muted;
+            }
+        }
+        self.preset_name = preset.name.clone();
+        self.pending_preset = Some(preset);
+        self.notice = (!missing.is_empty()).then(|| {
+            format!(
+                "The preset was applied, but these outputs are not connected: {}",
+                missing.join(", ")
+            )
+        });
+        self.save_config();
+    }
+
     fn initialize_selection(&mut self) {
         if self.config.selection_initialized {
             return;

@@ -4,9 +4,13 @@ Audio Splitter is a native COSMIC desktop application that plays the same deskto
 
 Splitting remains active while the application is open. Closing the application stops the temporary route and restores the previous output. A background service is intentionally outside the 1.0 scope so session ownership and recovery remain predictable.
 
+Each output can be auditioned with a short test tone. During an active split, selected outputs have independent volume and mute controls. Named presets remember the selected outputs, their levels and mute state, and the delay-compensation option.
+
 ## How it works
 
 The application asks PipeWire's PulseAudio-compatible control service to create a temporary `module-combine-sink`. PipeWire remains responsible for audio fan-out, resampling, and clock handling—the application never copies audio samples itself. Existing playback streams are moved to the temporary output when splitting starts, and the previous default output is restored when it stops.
+
+The output test is generated locally at runtime and sent through `pactl`'s sample cache to one explicit device. It does not require a bundled audio file or a separate media player.
 
 Minimum-latency mode is the default. **Compensate device delay** can reduce drift between unlike devices, but it may add buffering. Bluetooth devices always add their own codec and radio latency, which software cannot eliminate completely.
 

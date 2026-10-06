@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
-  <id>io.github.okrroni.splitter</id>
+  <id>io.github.okrroni.cosmic_audio_splitter</id>
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <name>Audio Splitter</name>
@@ -8,6 +8,7 @@
   <description>
     <p>Audio Splitter creates a temporary combined PipeWire output so the same desktop audio can play through two or more devices.</p>
     <p>It moves active playback to the combined output, restores the previous output when stopped, and recovers temporary routing left by an interrupted session.</p>
+    <p>Test outputs individually, control their volume and mute state, and save reusable output presets.</p>
     <p>Minimum-latency mode is the default, with optional compensation for differences between device clocks.</p>
   </description>
   <developer id="io.github.okrroni">
@@ -16,7 +17,7 @@
   <url type="homepage">https://github.com/okrroni/splitter</url>
   <url type="bugtracker">https://github.com/okrroni/splitter/issues</url>
   <url type="vcs-browser">https://github.com/okrroni/splitter</url>
-  <launchable type="desktop-id">io.github.okrroni.splitter.desktop</launchable>
+  <launchable type="desktop-id">io.github.okrroni.cosmic_audio_splitter.desktop</launchable>
   <provides>
     <id>com.system76.CosmicApplication</id>
     <binary>cosmic-audio-splitter</binary>
