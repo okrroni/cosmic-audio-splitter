@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.okrroni.AudioSplitter</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>Audio Splitter</name>
+  <summary>Play desktop audio through multiple outputs</summary>
+  <description>
+    <p>Audio Splitter creates a temporary combined PipeWire output so the same desktop audio can play through two or more devices.</p>
+    <p>It favors minimum latency by default and can optionally compensate for differences between device clocks.</p>
+  </description>
+  <developer id="io.github.okrroni">
+    <name>Oscar</name>
+  </developer>
+  <url type="homepage">https://github.com/okrroni/cosmic-audio-spliter</url>
+  <url type="vcs-browser">https://github.com/okrroni/cosmic-audio-spliter</url>
+  <launchable type="desktop-id">io.github.okrroni.AudioSplitter.desktop</launchable>
+  <provides>
+    <id>com.system76.CosmicApplication</id>
+    <binary>cosmic-audio-splitter</binary>
+  </provides>
+  <requires>
+    <display_length compare="ge">440</display_length>
+  </requires>
+  <supports>
+    <control>keyboard</control>
+    <control>pointing</control>
+    <control>touch</control>
+  </supports>
+  <categories>
+    <category>Audio</category>
+    <category>AudioVideo</category>
+  </categories>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.0" date="2026-08-13">
+      <description><p>Initial release.</p></description>
+    </release>
+  </releases>
+</component>

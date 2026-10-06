@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>Audio Splitter</title>
+  <rect x="8" y="8" width="112" height="112" rx="28" fill="#8b5cf6"/>
+  <path d="M30 58h14l18-15v42L44 70H30z" fill="#fff"/>
+  <path d="M63 64h16M96 64h9M86 64l10-18M86 64l10 18" fill="none" stroke="#ddd6fe" stroke-width="5" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="100" cy="44" r="6" fill="#ddd6fe"/>
+  <circle cx="100" cy="84" r="6" fill="#ddd6fe"/>
+</svg>
